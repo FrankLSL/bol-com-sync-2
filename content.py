@@ -133,10 +133,8 @@ def build_body(ean, prop, velden, chunk=''):
             a.append({'id': k, 'values': [{'value': str(v), 'unitId': 'unece.unit.CMT'}]})
     body = {'language': 'nl', 'attributes': a}
     if 'fotos' in velden and prop['fotos']:
-        body['assets'] = [{'url': u, 'labels': ['FRONT']} if i == 0 else {'url': u, 'labels': []} for i, u in enumerate(prop['fotos'])]
-        for x in body['assets']:
-            if not x['labels']:
-                x.pop('labels')
+        # bol eist een label per foto: hoofdfoto FRONT, de rest SIDE
+        body['assets'] = [{'url': u, 'labels': ['FRONT' if i == 0 else 'SIDE']} for i, u in enumerate(prop['fotos'])]
     return body
 
 

@@ -418,7 +418,8 @@ async def content_send(sku: str, request: Request):
         content.send(ean, sku, content.proposal(v), velden, request.state.user['u'], chunk)
     except Exception as e:
         store.log(request.state.user['u'], 'content naar bol', sku, ean, False, str(e))
-        raise HTTPException(502, 'bol weigerde: ' + str(e)[:400])
+        return HTMLResponse(page('Mislukt', nav('/productinfo') + f'<h1>bol weigerde het voorstel</h1><div class="box bad">{E(str(e)[:800])}</div>'
+                                 f'<a class="btn sec" href="/content/{E(sku)}">← terug naar {E(sku)}</a>'), status_code=502)
     if chunk:
         content.learn_chunk(v.get('type') or '', chunk)
     return RedirectResponse('/productinfo?msg=Verstuurd: ' + sku, status_code=303)
