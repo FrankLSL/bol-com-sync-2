@@ -253,7 +253,7 @@ def producten(request: Request, f: str = 'niet', q: str = ''):
                    'dubbel': '<span class="pill bad">SKU dubbel in Shopify</span>'}[r['st']]
             if not r['live']:
                 stt += '<span class="pill warn">niet live</span>'
-            act = (f'<button class="s" onclick="zet(this,{json.dumps(r["sku"])})">Zet op bol</button>' if can and r['st'] == 'niet' and r['live'] else '')
+            act = (f'<button class="s" data-sku="{E(r["sku"])}" onclick="zet(this, this.dataset.sku)">Zet op bol</button>' if can and r['st'] == 'niet' and r['live'] else '')
         body.append(f'<tr><td>{f"<img class=t src={E(r["foto"])}&width=88 loading=lazy>" if r["foto"] else ""}</td>'
                     f'<td><a href="{E(r["url"])}" target="_blank" rel="noopener">{E(r["titel"])}</a><div class="small mut">{E(r["merk"])}</div></td>'
                     f'<td class="small">{E(r["sku"])}</td><td class="small">{E(r["ean"])}</td><td class="r">{eur(r["prijs"])}</td>'
