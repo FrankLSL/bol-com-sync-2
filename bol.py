@@ -108,5 +108,55 @@ def create_offer(ean, reference, price, stock, tpl):
     return call('POST', '/retailer/offers', body)
 
 
+MT10 = 'application/vnd.retailer.v10+json'
+
+
+def call10(method, path, body=None, tries=6, lang=None):
+    """Retailer API v10 (content). Accept-Language voor catalogusvragen."""
+    for i in range(tries):
+        h = {'Authorization': 'Bearer ' + token(), 'Accept': MT10}
+        if body is not None:
+            h['Content-Type'] = MT10
+        if lang:
+            h['Accept-Language'] = lang
+        r = requests.request(method, BASE + path, json=body, headers=h, timeout=60)
+        if r.status_code == 429 or r.status_code >= 500:
+            time.sleep(float(r.headers.get('Retry-After') or 0) or 1.5 * 2 ** i)
+            continue
+        if r.status_code == 401 and i == 0:
+            _tok['t'] = None
+            continue
+        if r.status_code == 404:
+            return None
+        if not r.ok:
+            raise BolError(f'{method} {path}: HTTP {r.status_code} {r.text[:600]}', r.status_code, r.text)
+        return r.json() if r.text else None
+    raise BolError(f'{method} {path}: opgegeven na {tries} pogingen')
+
+
+def catalog_product(ean, lang='nl'):
+    """Huidige bol-content van een EAN (None als bol hem niet kent)."""
+    return call10('GET', f'/retailer/content/catalog-products/{ean}', lang=lang)
+
+
+def post_content(body):
+    """Productcontent indienen (asynchroon). Geeft process-status terug (processStatusId)."""
+    return call10('POST', '/retailer/content/products', body)
+
+
+def process_status(pid):
+    return call10('GET', f'/shared/process-status/{pid}')
+
+
+def upload_report(upload_id):
+    return call10('GET', f'/retailer/content/upload-report/{upload_id}')
+
+
+def chunk_recommendations(titel, omschrijving=''):
+    return call10('POST', '/retailer/content/chunk-recommendations',
+                  {'productContents': [{'attributes': [{'id': 'Name', 'values': [{'value': titel}]},
+                                                       {'id': 'Description', 'values': [{'value': omschrijving[:4000]}]}]}]})
+
+
 def not_for_sale_reasons(offer_id):
     return call('GET', f'/retailer/offers/{offer_id}/not-for-sale-reasons')

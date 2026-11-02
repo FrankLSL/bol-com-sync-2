@@ -68,6 +68,17 @@ def _start():
     lsl_backup.start('bol', store.DATA)
     if bol.configured() and shopify.configured() and not store.kv_get('cache_bol'):
         threading.Thread(target=_refresh_bg, daemon=True).start()
+    # onderhoud: RUN_ON_START=proef (proefrun bij opstarten) of catalog:<EAN> (bol-content van één EAN naar de log)
+    for ros in [x.strip() for x in os.getenv('RUN_ON_START', '').split(',') if x.strip()]:
+        if ros == 'proef':
+            sync.run_async('opstart', True)
+        elif ros.startswith('catalog:'):
+            def _cat(e=ros.split(':', 1)[1]):
+                try:
+                    print('CATALOG', e, json.dumps(bol.catalog_product(e), ensure_ascii=False)[:6000], flush=True)
+                except Exception as ex:
+                    print('CATALOG fout', e, ex, flush=True)
+            threading.Thread(target=_cat, daemon=True).start()
 
 
 lsl_backup.mount(app, 'bol', store.DATA, lambda r: r.state.user['r'] == 'beheerder')
