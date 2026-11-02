@@ -7,6 +7,9 @@ Tool in de Loungesetland-omgeving (tegel **bol.com** in de portal) voor:
   en op verzoek (proefrun of doorvoeren). Elke run met alle regels terug te zien en als csv te downloaden.
 - **Producten** — alle Shopify-producten met hun bol-status; *Zet op bol* maakt het aanbod aan met de eerstvolgende vrije EAN,
   prijs site +10% en dezelfde levering/landen als je bestaande aanbod.
+- **Productinfo** — per product links wat er nu op bol staat, rechts het voorstel uit Shopify (titel, beschrijving, kleur, afmetingen, foto's);
+  versturen via de Product Content API v10. Rapport per veld (overgenomen/geweigerd) na ±1 uur. Nieuwe producten krijgen bij *Zet op bol*
+  automatisch productinfo mee als de productgroep (GPC) bekend is van vergelijkbare producten.
 - **EAN-codes** — eigen voorraad EAN's (startlijst `seed/eans.csv`), plus alles wat al op bol staat; een code wordt nooit dubbel uitgegeven.
   Nieuwe codes toevoegen via Excel/csv-upload.
 

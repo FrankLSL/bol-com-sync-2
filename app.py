@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, Form, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-import bol, lsl_backup, lsl_icons, lsl_sso, shopify, store, sync
+import bol, content, lsl_backup, lsl_icons, lsl_sso, shopify, store, sync
 
 E = lambda s: html.escape(str(s if s is not None else ''))
 BASE = Path(__file__).parent
@@ -19,6 +19,7 @@ ROLES = {'beheerder': 'Beheerder', 'bekijker': 'Bekijker'}
 OPEN = ('/healthz', '/sso/', '/static/', '/favicon.ico', '/apple-touch-icon.png', '/apple-touch-icon-precomposed.png', '/manifest.webmanifest')
 
 store.init()
+content.init()
 app = FastAPI(title='Loungesetland bol.com', docs_url=None, redoc_url=None, openapi_url=None)
 lsl_sso.csrf_middleware(app)
 lsl_sso.speed_middleware(app)
@@ -65,6 +66,7 @@ def admin(request):
 @app.on_event('startup')
 def _start():
     sync.start_scheduler()
+    content.start_checker()
     lsl_backup.start('bol', store.DATA)
     if bol.configured() and shopify.configured() and not store.kv_get('cache_bol'):
         threading.Thread(target=_refresh_bg, daemon=True).start()
@@ -116,7 +118,7 @@ input,select{font:inherit;padding:7px 9px;border:1px solid var(--line);border-ra
 .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}.sp{flex:1}.tabs a{padding:6px 12px}
 img.t{width:44px;height:32px;object-fit:cover;border-radius:6px;background:#eee}
 """
-TABS = [('/', 'Producten'), ('/sync', 'Prijs-sync'), ('/ean', 'EAN-codes'), ('/log', 'Logboek')]
+TABS = [('/', 'Producten'), ('/productinfo', 'Productinfo'), ('/sync', 'Prijs-sync'), ('/ean', 'EAN-codes'), ('/log', 'Logboek')]
 
 
 def page(title, body):
@@ -244,7 +246,7 @@ def producten(request: Request, f: str = 'niet', q: str = ''):
                 stt += '<div class="small" style="color:var(--warn)">prijs gaat mee bij volgende sync</div>'
             if o and not o.get('forSale'):
                 stt += '<span class="pill warn">niet te koop</span>'
-            act = ''
+            act = f'<a class="btn sec s" href="/content/{E(r["sku"])}">Productinfo</a>' if r['sku'] else ''
         else:
             bp = None
             stt = {'niet': '<span class="pill grey">niet op bol</span>', 'geen_sku': '<span class="pill bad">geen SKU</span>',
@@ -266,7 +268,7 @@ async function zet(b, sku){
     const r = await fetch('/api/zet-op-bol', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({sku, stock: +st})});
     const d = await r.json();
     if(!r.ok) throw new Error(d.detail || r.status);
-    b.parentElement.innerHTML = '<span class="pill">aangemaakt</span><div class="small">EAN ' + d.ean + ' · € ' + d.prijs + '</div>' + (d.melding ? '<div class="small" style="color:#8a5a00">' + d.melding + '</div>' : '');
+    b.parentElement.innerHTML = '<span class="pill">aangemaakt</span><div class="small">EAN ' + d.ean + ' · € ' + d.prijs + '</div>' + (d.melding ? '<div class="small" style="color:#8a5a00">' + d.melding + '</div>' : '') + '<a class="btn sec s" href="/content/' + encodeURIComponent(sku) + '">Productinfo</a>';
   }catch(e){ b.disabled = false; b.textContent = 'Opnieuw'; alert('Mislukt: ' + e.message); }
 }
 </script>"""
@@ -318,11 +320,139 @@ async def api_zet(request: Request):
                 melding = 'Nog niet te koop: ' + '; '.join(str(r.get('description') or r.get('code') or r) for r in rs)[:300]
     except Exception:
         pass
+    try:  # bol kent het product nog niet: meteen productinfo meesturen als de productgroep bekend is
+        if content.current(ean) is None:
+            chunk = content.guess_chunk(v.get('type') or '')
+            if chunk:
+                content.send(ean, sku, content.proposal(v), ['titel', 'beschrijving', 'kleur', 'afmetingen', 'fotos'], door, chunk)
+                melding = (melding + ' · ' if melding else '') + 'productinfo + foto\'s naar bol gestuurd (productgroep ' + chunk + ')'
+            else:
+                melding = (melding + ' · ' if melding else '') + 'bol kent dit product nog niet: open Productinfo om titel, tekst en foto\'s in te sturen'
+    except Exception as e:
+        melding = (melding + ' · ' if melding else '') + 'productinfo niet verstuurd: ' + str(e)[:150]
     cache = sync.cached('bol')
     cache['rows'].append({'offerId': oid, 'ean': ean, 'reference': sku, 'price': prijs, 'bundles': 1, 'stock': stock, 'forSale': not melding})
     store.kv_set('cache_bol', cache)
     store.log(door, 'zet op bol', sku, ean, True, json.dumps({'offerId': oid, 'prijs': prijs, 'voorraad': stock, 'melding': melding}))
     return {'ok': True, 'ean': ean, 'prijs': f'{prijs:.2f}'.replace('.', ','), 'offerId': oid, 'melding': melding}
+
+
+# ---------- productinfo (content) ----------
+VELDEN = [('titel', 'Titel'), ('beschrijving', 'Beschrijving'), ('kleur', 'Kleur'), ('afmetingen', 'Afmetingen'), ('fotos', "Foto's")]
+
+
+def _variant(sku):
+    m = [v for v in sync.cached('shop')['rows'] if v['sku'] == sku]
+    if not m:
+        raise HTTPException(404, 'SKU niet gevonden in Shopify — ververs eerst')
+    return m[0]
+
+
+def _ean_of(sku):
+    o = next((o for o in sync.cached('bol')['rows'] if o.get('reference') == sku), None)
+    if o and o.get('ean'):
+        return store.norm_ean(o['ean'])
+    e = store.ean_for_sku(sku)
+    return e['ean'] if e else ''
+
+
+@app.get('/content/{sku:path}', response_class=HTMLResponse)
+def content_page(sku: str, request: Request):
+    v = _variant(sku)
+    ean = _ean_of(sku)
+    prop = content.proposal(v)
+    cur, err = None, ''
+    if ean:
+        try:
+            cur = content.current(ean)
+            if cur:
+                content.learn_chunk(prop['type'], cur['chunk'])
+        except Exception as e:
+            err = str(e)[:300]
+    chunk = (cur or {}).get('chunk') or content.guess_chunk(prop['type'])
+    fotos_nu = len((cur or {}).get('attrs', {}).get('Image', []) or [])
+    afm = ', '.join(f'{k.replace("Product ", "").replace("Width", "breedte").replace("Depth", "diepte").replace("Height", "hoogte")} {v} cm' for k, v in prop['afmetingen'].items()) or '<span class="mut">niet gevonden in specs</span>'
+    cur_afm = ', '.join(f'{k.replace("Product ", "")} {", ".join(map(str, cur["attrs"][k]))}' for k in ('Product Width', 'Product Depth', 'Product Height') if cur and cur['attrs'].get(k)) if cur else ''
+    def cell(x):
+        return x if x else '<span class="mut">–</span>'
+    rows = [
+        ('Titel', E((cur or {}).get('titel')), E(prop['titel'])),
+        ('Kleur', E(', '.join((cur or {}).get('attrs', {}).get('Colour', []) or [])), E(prop['kleur'])),
+        ('Afmetingen', E(cur_afm), afm),
+        ("Foto's", '', ''.join(f'<img class=t src="{E(u)}&width=120" style="width:70px;height:50px;margin:2px">' for u in prop['fotos']) + f'<div class="small mut">{len(prop["fotos"])} foto\'s uit Shopify, eerste als hoofdfoto</div>'),
+        ('Beschrijving', f'<div style="max-height:360px;overflow:auto" class="small">{(cur or {}).get("beschrijving") or ""}</div>', f'<div style="max-height:360px;overflow:auto" class="small">{prop["beschrijving"]}</div>'),
+    ]
+    tr = ''.join(f'<tr><th style="position:static;width:110px">{l}</th><td style="width:45%">{cell(a)}</td><td>{cell(b)}</td></tr>' for l, a, b in rows)
+    can = request.state.user['r'] == 'beheerder' and bool(ean)
+    status = ('<span class="pill bad">bol kent dit product nog niet</span>' if ean and not cur and not err else
+              (f'<span class="pill">{"gepubliceerd" if cur["published"] else "niet gepubliceerd"}</span> <span class="pill grey">verrijking {cur["enrichment"]}/2</span> <span class="pill grey">productgroep {E(cur["chunk"])}</span> <span class="pill grey">merk {E(cur["merk"])}</span>' if cur else ''))
+    form = ''
+    if can:
+        checks = ''.join(f'<label style="display:inline-block;margin-right:14px"><input type="checkbox" name="v" value="{k}" checked style="width:auto"> {l}</label>' for k, l in VELDEN)
+        form = (f'<form method="post" action="/content/{E(sku)}" class="box" onsubmit="return confirm(\'Dit voorstel naar bol sturen? bol beslist zelf of het wordt overgenomen.\')">'
+                f'<h2>Naar bol sturen</h2><div>{checks}</div>'
+                f'<label class="small mut">Productgroep (GPC-code){" — verplicht, bol kent het product nog niet" if not cur else ""}</label>'
+                f'<input name="chunk" value="{E(chunk if not cur else "")}" placeholder="{E(chunk or "bv. 80006655")}" style="width:160px" {"" if not cur else "disabled"}>'
+                f'<p class="small mut">Productgroep {"blijft " + E(cur["chunk"]) + " (bestaand product)" if cur else ("voorgesteld op basis van andere " + E(prop["type"]) + "-producten" if chunk else "onbekend: zoek de code op in het datamodel van bol")}. '
+                'Na ±1 uur staat onder Productinfo per veld of bol het heeft overgenomen.</p><button>Verstuur naar bol</button></form>')
+    body = (nav('/productinfo') + f'<h1>{E(v["titel"])}</h1><div class="bar small"><span>SKU {E(sku)}</span><span>EAN {E(ean or "—")}</span>{status}</div>'
+            + (f'<div class="box bad">{E(err)}</div>' if err else '') + ('' if ean else '<div class="box bad">Nog geen EAN: zet het product eerst op bol.</div>')
+            + f'<div class="box"><table><tr><th style="position:static"></th><th style="position:static">Nu op bol</th><th style="position:static">Voorstel uit Shopify</th></tr>{tr}</table></div>' + form)
+    return page('Productinfo', body)
+
+
+@app.post('/content/{sku:path}')
+async def content_send(sku: str, request: Request):
+    admin(request)
+    f = await request.form()
+    velden = [x for x in f.getlist('v') if x in dict(VELDEN)]
+    v = _variant(sku)
+    ean = _ean_of(sku)
+    if not ean or not velden:
+        raise HTTPException(400, 'Geen EAN of geen velden gekozen')
+    cur = content.current(ean)
+    chunk = '' if cur else (f.get('chunk') or '').strip()
+    if not cur and not chunk:
+        raise HTTPException(400, 'bol kent dit product nog niet: vul de productgroep (GPC-code) in')
+    try:
+        content.send(ean, sku, content.proposal(v), velden, request.state.user['u'], chunk)
+    except Exception as e:
+        store.log(request.state.user['u'], 'content naar bol', sku, ean, False, str(e))
+        raise HTTPException(502, 'bol weigerde: ' + str(e)[:400])
+    if chunk:
+        content.learn_chunk(v.get('type') or '', chunk)
+    return RedirectResponse('/productinfo?msg=Verstuurd: ' + sku, status_code=303)
+
+
+@app.get('/productinfo', response_class=HTMLResponse)
+def productinfo_page(request: Request, msg: str = ''):
+    ups = content.uploads()
+    tr = ''
+    for u in ups:
+        sm = content.summary(u['rapport']) if u['status'] == 'klaar' else {}
+        res = ''
+        if sm:
+            res = (f'<span class="ok">{len(sm["ok"])} overgenomen</span>' + (f' · <span class="bad">{len(sm["nee"])} geweigerd: {E("; ".join(sm["nee"][:6]))}</span>' if sm['nee'] else ''))
+        elif u['status'] == 'fout' or (u['rapport'] and '"fout"' in (u['rapport'] or '')):
+            res = f'<span class="bad small">{E((u["rapport"] or "")[:300])}</span>'
+        else:
+            res = '<span class="mut small">rapport volgt ±1 uur na indienen</span>'
+        tr += (f'<tr><td class="small">{E(u["t"])}</td><td>{E(u["door"])}</td><td><a href="/content/{E(u["sku"])}">{E(u["sku"])}</a></td><td class="small">{E(u["ean"])}</td>'
+               f'<td class="small">{E(u["velden"])}</td><td><span class="pill {"" if u["status"] == "klaar" else ("bad" if u["status"] == "fout" else "warn")}">{E(u["status"])}</span></td><td>{res}</td></tr>')
+    knop = '<form method="post" action="/productinfo/check" style="margin:0"><button class="sec s">↻ Status nu ophalen</button></form>' if request.state.user['r'] == 'beheerder' else ''
+    body = (nav('/productinfo') + '<h1>Productinfo naar bol</h1>' + (f'<div class="box ok">{E(msg)}</div>' if msg else '') +
+            '<div class="box"><p>Kies bij <a href="/?f=op_bol">Producten</a> een product en klik op <b>Productinfo</b>: links wat er nu op bol staat, rechts het voorstel uit Shopify '
+            '(titel, beschrijving, kleur, afmetingen, foto\'s). bol beslist zelf of het wordt overgenomen; bij merkproducten kan de info van het merk voorgaan.</p>'
+            f'<div class="bar">{knop}<span class="small mut">Status wordt elke 10 minuten automatisch bijgewerkt.</span></div></div>'
+            f'<div class="box"><table><tr><th>Ingediend</th><th>Door</th><th>SKU</th><th>EAN</th><th>Velden</th><th>Status</th><th>Resultaat</th></tr>{tr}</table></div>')
+    return page('Productinfo', body)
+
+
+@app.post('/productinfo/check')
+def productinfo_check(request: Request):
+    admin(request)
+    threading.Thread(target=content.check_uploads, daemon=True).start()
+    return RedirectResponse('/productinfo?msg=Status wordt opgehaald — ververs de pagina over een minuut', status_code=303)
 
 
 # ---------- prijs-sync ----------
