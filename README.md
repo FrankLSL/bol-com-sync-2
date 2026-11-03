@@ -10,6 +10,10 @@ Tool in de Loungesetland-omgeving (tegel **bol.com** in de portal) voor:
 - **Productinfo** — per product links wat er nu op bol staat, rechts het voorstel uit Shopify (titel, beschrijving, kleur, afmetingen, foto's);
   versturen via de Product Content API v10. Rapport per veld (overgenomen/geweigerd) na ±1 uur. Nieuwe producten krijgen bij *Zet op bol*
   automatisch productinfo mee als de productgroep (GPC) bekend is van vergelijkbare producten.
+- **Orders** — open bol-orders (eigen bezorging) worden elke 10 minuten opgehaald. Per order een voorstel: Shopify-producten via
+  reference = SKU (handmatig te wijzigen), bol-verkoopprijs, klant/adres, commissie en netto. *Goedkeuren* maakt een betaalde Shopify-order
+  (draft → afgerond) met tags `bol.com` + `bol-<ordernr>`, PO-nummer = bol-ordernummer, commissie/netto in notitie en extra velden, zonder
+  klantmail; vaste leverdatum als planner-tag. *Afkeuren* met reden. Nodig in Shopify: write_draft_orders (zelfde app als planner).
 - **EAN-codes** — eigen voorraad EAN's (startlijst `seed/eans.csv`), plus alles wat al op bol staat; een code wordt nooit dubbel uitgegeven.
   Nieuwe codes toevoegen via Excel/csv-upload.
 

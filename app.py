@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, Form, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-import bol, content, lsl_backup, lsl_icons, lsl_sso, shopify, store, sync
+import bol, content, lsl_backup, lsl_icons, lsl_sso, orders, shopify, store, sync
 
 E = lambda s: html.escape(str(s if s is not None else ''))
 BASE = Path(__file__).parent
@@ -20,6 +20,7 @@ OPEN = ('/healthz', '/sso/', '/static/', '/favicon.ico', '/apple-touch-icon.png'
 
 store.init()
 content.init()
+orders.init()
 app = FastAPI(title='Loungesetland bol.com', docs_url=None, redoc_url=None, openapi_url=None)
 lsl_sso.csrf_middleware(app)
 lsl_sso.speed_middleware(app)
@@ -67,6 +68,7 @@ def admin(request):
 def _start():
     sync.start_scheduler()
     content.start_checker()
+    orders.start_poller()
     lsl_backup.start('bol', store.DATA)
     if bol.configured() and shopify.configured() and not store.kv_get('cache_bol'):
         threading.Thread(target=_refresh_bg, daemon=True).start()
@@ -118,7 +120,7 @@ input,select{font:inherit;padding:7px 9px;border:1px solid var(--line);border-ra
 .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}.sp{flex:1}.tabs a{padding:6px 12px}
 img.t{width:44px;height:32px;object-fit:cover;border-radius:6px;background:#eee}
 """
-TABS = [('/', 'Producten'), ('/productinfo', 'Productinfo'), ('/sync', 'Prijs-sync'), ('/ean', 'EAN-codes'), ('/log', 'Logboek')]
+TABS = [('/', 'Producten'), ('/orders', 'Orders'), ('/productinfo', 'Productinfo'), ('/sync', 'Prijs-sync'), ('/ean', 'EAN-codes'), ('/log', 'Logboek')]
 
 
 def page(title, body):
@@ -129,7 +131,9 @@ def page(title, body):
 
 
 def nav(cur):
-    return '<div class="bar tabs">' + ''.join(f'<a class="btn {"" if h == cur else "sec"}" href="{h}">{l}</a>' for h, l in TABS) + '</div>'
+    n = orders.counts().get('nieuw', 0)
+    lab = lambda h, l: l + (f' <span class="pill bad" style="margin-left:4px">{n}</span>' if h == '/orders' and n else '')
+    return '<div class="bar tabs">' + ''.join(f'<a class="btn {"" if h == cur else "sec"}" href="{h}">{lab(h, l)}</a>' for h, l in TABS) + '</div>'
 
 
 def eur(v):
@@ -335,6 +339,135 @@ async def api_zet(request: Request):
     store.kv_set('cache_bol', cache)
     store.log(door, 'zet op bol', sku, ean, True, json.dumps({'offerId': oid, 'prijs': prijs, 'voorraad': stock, 'melding': melding}))
     return {'ok': True, 'ean': ean, 'prijs': f'{prijs:.2f}'.replace('.', ','), 'offerId': oid, 'melding': melding}
+
+
+# ---------- bol-orders ----------
+OST = [('nieuw', 'Te beoordelen'), ('goedgekeurd', 'In Shopify'), ('afgekeurd', 'Afgekeurd'), ('alles', 'Alles')]
+
+
+@app.get('/orders', response_class=HTMLResponse)
+def orders_page(request: Request, s: str = 'nieuw', msg: str = ''):
+    c = orders.counts()
+    kp = ''.join(f'<a class="kpi {"on" if k == s else ""}" href="/orders?s={k}"><div class="v">{sum(c.values()) if k == "alles" else c.get(k, 0)}</div><div class="l">{l}</div></a>' for k, l in OST)
+    tr = ''
+    for r in orders.lijst(s):
+        d = json.loads(r['data'] or '{}')
+        sd = d.get('shipmentDetails') or {}
+        items = d.get('orderItems') or []
+        prod = '<br>'.join(f'{E(i.get("quantity"))}× {E((i.get("product") or {}).get("title") or (i.get("offer") or {}).get("reference") or i.get("ean"))}' for i in items)
+        st = {'nieuw': '<span class="pill warn">te beoordelen</span>', 'goedgekeurd': f'<span class="pill">Shopify {E(r["shopify_naam"])}</span>',
+              'afgekeurd': f'<span class="pill bad">afgekeurd</span><div class="small mut">{E(r["reden"])}</div>'}.get(r['status'], E(r['status']))
+        if any(i.get('cancellationRequest') for i in items):
+            st += '<span class="pill bad">annuleringsverzoek</span>'
+        tr += (f'<tr><td class="small">{E(r["geplaatst"])}</td><td><a href="/orders/{E(r["order_id"])}">{E(r["order_id"])}</a></td>'
+               f'<td>{E(sd.get("firstName"))} {E(sd.get("surname"))}<div class="small mut">{E(sd.get("zipCode"))} {E(sd.get("city"))}</div></td>'
+               f'<td class="small">{prod}</td><td class="r">{eur(r["totaal"])}</td><td class="r">{eur(r["commissie"])}</td><td>{st}</td></tr>')
+    fout = store.kv_get('orders_fout')
+    knop = '<form method="post" action="/orders/ophalen" style="margin:0"><button class="sec s">↻ Nu ophalen bij bol</button></form>' if request.state.user['r'] == 'beheerder' else ''
+    body = (nav('/orders') + '<h1>bol-orders</h1>' + notice() + (f'<div class="box ok">{E(msg)}</div>' if msg else '') +
+            f'<div class="bar small mut"><span>Laatst opgehaald: {E(store.kv_get("orders_opgehaald") or "nog niet")} · elke 10 minuten automatisch (open orders, eigen bezorging)</span>'
+            f'<span class="sp"></span>{knop}</div>' + (f'<div class="box bad small">Laatste fout bij ophalen: {E(fout)}</div>' if fout else '') +
+            f'<div class="kpis">{kp}</div><div class="box"><table><tr><th>Geplaatst</th><th>bol-order</th><th>Klant</th><th>Producten</th><th class="r">Omzet</th><th class="r">Commissie</th><th>Status</th></tr>{tr}</table></div>')
+    return page('Orders', body)
+
+
+@app.post('/orders/ophalen')
+def orders_fetch(request: Request):
+    admin(request)
+    try:
+        n = orders.fetch()
+        store.kv_set('orders_fout', None)
+        return RedirectResponse(f'/orders?msg={n} nieuwe order(s) opgehaald', status_code=303)
+    except Exception as e:
+        store.kv_set('orders_fout', f'{store.now()} {str(e)[:300]}')
+        return RedirectResponse('/orders', status_code=303)
+
+
+def _overrides(request):
+    return {k[4:]: v.strip() for k, v in request.query_params.items() if k.startswith('sku_') and v.strip()}
+
+
+@app.get('/orders/{oid}', response_class=HTMLResponse)
+def order_page(oid: str, request: Request, msg: str = ''):
+    row = orders.get(oid)
+    if not row:
+        raise HTTPException(404, 'Order niet gevonden')
+    ov = _overrides(request)
+    p = orders.proposal(row, sync.cached('shop')['rows'], ov)
+    k = p['klant']
+    can = request.state.user['r'] == 'beheerder' and row['status'] == 'nieuw'
+    tr = ''
+    for r in p['regels']:
+        v = r['variant']
+        skucell = (f'<input name="sku_{E(r["id"])}" value="{E(r["sku"])}" style="width:220px">' if can else E(r['sku']))
+        tr += (f'<tr><td>{E(r["titel"])}<div class="small mut">EAN {E(r["ean"])} · bol-ref {E(r["ref"] or "—")}</div></td>'
+               f'<td>{skucell}<div class="small {"ok" if v else "bad"}">{E(v["titel"]) if v else ""}{(" · " if v and r["waarsch"] else "") + E(r["waarsch"])}</div></td>'
+               f'<td class="r">{r["aantal"]}</td><td class="r">{eur(r["prijs"])}</td><td class="r small mut">{eur(r["site"])}</td><td class="r">{eur(r["commissie"])}</td></tr>')
+    prob = ''.join(f'<li>{E(x)}</li>' for x in p['problemen'])
+    status = {'nieuw': '<span class="pill warn">te beoordelen</span>', 'goedgekeurd': f'<span class="pill">in Shopify als {E(row["shopify_naam"])}</span>',
+              'afgekeurd': f'<span class="pill bad">afgekeurd: {E(row["reden"])}</span>'}.get(row['status'], '')
+    acties = ''
+    if can:
+        acties = (f'<div class="box"><div class="bar">'
+                  f'<button form="kopp" class="sec">Koppeling bijwerken</button>'
+                  f'<form method="post" action="/orders/{E(oid)}/goedkeuren" style="margin:0" onsubmit="return confirm(\'Order aanmaken in Shopify (als betaald, tag bol.com)?\')">'
+                  + ''.join(f'<input type="hidden" name="sku_{E(a)}" value="{E(b)}">' for a, b in ov.items()) +
+                  f'<button {"disabled" if any(not r["variant"] for r in p["regels"] if r["aantal"] > 0) else ""}>Goedkeuren → Shopify</button></form>'
+                  f'<span class="sp"></span><form method="post" action="/orders/{E(oid)}/afkeuren" class="bar" style="margin:0">'
+                  f'<input name="reden" placeholder="Reden (bv. geannuleerd, dubbel, handmatig gedaan)" style="width:300px" required><button class="sec">Afkeuren</button></form></div>'
+                  '<p class="small mut">Goedkeuren maakt een betaalde Shopify-order met de bol-prijzen, tag <b>bol.com</b> en het bol-ordernummer als PO-nummer; '
+                  'commissie en netto staan in de notitie en als extra velden. Er gaat geen mail naar de klant. De voorraad gaat eraf zoals bij een gewone order.</p></div>')
+    elif row['status'] == 'afgekeurd' and request.state.user['r'] == 'beheerder':
+        acties = f'<form method="post" action="/orders/{E(oid)}/heropen" class="box"><button class="sec">Terug naar te beoordelen</button></form>'
+    body = (nav('/orders') + f'<h1>bol-order {E(oid)}</h1><div class="bar small"><a class="btn sec s" href="/orders">← terug</a><span>geplaatst {E(row["geplaatst"])}</span>{status}</div>'
+            + (f'<div class="box ok">{E(msg)}</div>' if msg else '') + (f'<div class="box bad"><b>Let op</b><ul>{prob}</ul></div>' if prob else '') +
+            '<div class="grid">'
+            f'<div class="box"><h2>Klant & bezorging</h2><p><b>{E(k["voornaam"])} {E(k["achternaam"])}</b>{"<br>" + E(k["bedrijf"]) if k["bedrijf"] else ""}<br>{E(k["adres"])}'
+            f'{"<br>" + E(k["adres2"]) if k["adres2"] else ""}<br>{E(k["postcode"])} {E(k["plaats"])} ({E(k["land"])})<br>Tel: {E(k["telefoon"] or "—")}<br>'
+            f'<span class="small mut">bol-mail: {E(k["email"] or "—")}</span>{"<br>BTW: " + E(k["btw"]) if k["btw"] else ""}</p>'
+            f'<p>Uiterlijk leveren: <b>{E(p["uiterlijk"] or "—")}</b>{" · vaste datum " + E(p["exact"]) if p["exact"] else ""}</p></div>'
+            f'<div class="box"><h2>Bedragen</h2><table><tr><td>Omzet (wat de klant op bol betaalde)</td><td class="r"><b>{eur(p["totaal"])}</b></td></tr>'
+            f'<tr><td>Commissie bol</td><td class="r">− {eur(p["commissie"])}</td></tr><tr><td>Netto van bol</td><td class="r"><b>{eur(p["netto"])}</b></td></tr></table></div></div>'
+            f'<form id="kopp" method="get" action="/orders/{E(oid)}"></form>'
+            f'<div class="box"><h2>Regels</h2><table><tr><th>bol-product</th><th>Shopify-SKU</th><th class="r">Aantal</th><th class="r">bol-prijs</th><th class="r">Site</th><th class="r">Commissie</th></tr>'
+            f'{tr.replace("<input name=", "<input form=kopp name=")}</table></div>' + acties)
+    return page('bol-order', body)
+
+
+@app.post('/orders/{oid}/goedkeuren')
+async def order_approve(oid: str, request: Request):
+    admin(request)
+    f = await request.form()
+    ov = {k[4:]: str(v).strip() for k, v in f.items() if k.startswith('sku_') and str(v).strip()}
+    row = orders.get(oid)
+    if not row:
+        raise HTTPException(404)
+    try:
+        orders.refresh_detail(oid)  # laatste stand (annuleringen) ophalen
+        row = orders.get(oid)
+    except Exception:
+        pass
+    p = orders.proposal(row, sync.cached('shop')['rows'], ov)
+    try:
+        o = orders.approve(oid, p, request.state.user['u'])
+    except Exception as e:
+        store.log(request.state.user['u'], 'bol-order → Shopify', '', '', False, json.dumps({'bol': oid, 'fout': str(e)[:400]}))
+        return HTMLResponse(page('Mislukt', nav('/orders') + f'<h1>Niet gelukt</h1><div class="box bad">{E(str(e)[:800])}</div><a class="btn sec" href="/orders/{E(oid)}">← terug</a>'), status_code=502)
+    return RedirectResponse(f'/orders/{oid}?msg=Aangemaakt in Shopify als {o.get("name")}', status_code=303)
+
+
+@app.post('/orders/{oid}/afkeuren')
+def order_reject(oid: str, request: Request, reden: str = Form('')):
+    admin(request)
+    orders.reject(oid, reden or 'afgekeurd', request.state.user['u'])
+    return RedirectResponse('/orders?msg=Order ' + oid + ' afgekeurd', status_code=303)
+
+
+@app.post('/orders/{oid}/heropen')
+def order_reopen(oid: str, request: Request):
+    admin(request)
+    orders.reopen(oid, request.state.user['u'])
+    return RedirectResponse(f'/orders/{oid}', status_code=303)
 
 
 # ---------- productinfo (content) ----------
